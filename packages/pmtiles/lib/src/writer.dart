@@ -3,11 +3,19 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
+import 'package:crypto/crypto.dart' as crypto;
 
 import 'archive.dart';
 import 'exceptions.dart';
 import 'header.dart';
 import 'zxy.dart';
+
+// Location of a tile's bytes within the temp spool file
+class _Loc {
+  final int offset;
+  final int length;
+  const _Loc(this.offset, this.length);
+}
 
 /// Result / statistics of a subset extraction.
 class ExtractResult {
@@ -70,25 +78,45 @@ Future<ExtractResult> _extractSubset(
 
   final source = await PmTilesArchive.from(sourceArchivePath);
   try {
-    final tiles = <int, List<int>>{}; // tileId -> compressed bytes
+    // Spool to temporary file
+    final tempPath = '${destinationPath}.tiles.tmp';
+    final tempFile = File(tempPath);
+    final tempSink = tempFile.openWrite();
+    final tileLoc = <int, _Loc>{};
+    final contentIndex = <String, _Loc>{}; // hash -> location
+    int tempOffset = 0;
     int missing = 0;
-    int totalTileBytes = 0;
-    for (final id in uniqueIds) {
-      final t = await source.tile(id);
+    // Use batching stream API for efficient reads
+    await for (final t in source.tiles(uniqueIds)) {
       try {
         final bytes = t.compressedBytes();
-        tiles[id] = bytes;
-        totalTileBytes += bytes.length;
+        // Deduplicate by SHA-256 of compressed bytes
+        final hash = crypto.sha256.convert(bytes).toString();
+        final existing = contentIndex[hash];
+        if (existing != null) {
+          tileLoc[t.id] = existing;
+          continue;
+        }
+        tempSink.add(bytes);
+        final loc = _Loc(tempOffset, bytes.length);
+        tileLoc[t.id] = loc;
+        contentIndex[hash] = loc;
+        tempOffset += bytes.length;
       } on TileNotFoundException {
+        missing++;
+      } catch (_) {
         missing++;
       }
     }
+    await tempSink.flush();
+    await tempSink.close();
 
-    if (tiles.isEmpty) {
+    if (tileLoc.isEmpty) {
       throw ArgumentError('None of the requested tiles (${uniqueIds.length}) exist in source archive.');
     }
 
-    final writtenIds = tiles.keys.toList()..sort();
+    final totalTileBytes = tempOffset;
+    final writtenIds = tileLoc.keys.toList()..sort();
     final n = writtenIds.length;
 
     // Compute header-derived stats from selected tiles
@@ -129,84 +157,97 @@ Future<ExtractResult> _extractSubset(
     }
 
     // Build root directory buffer mirroring Directory.from expectations.
-    final rootBytesInitial = <int>[];
-
-    // Number of entries
-    _writeVarint(rootBytesInitial, n);
-
+    final rootRaw = <int>[];
+    _writeVarint(rootRaw, n);
     int lastId = 0;
     for (final id in writtenIds) {
       final delta = id - lastId;
       lastId = id;
-      _writeVarint(rootBytesInitial, delta);
+      _writeVarint(rootRaw, delta);
     }
-
-    // runLength = 1 each
     for (var i = 0; i < n; i++) {
-      _writeVarint(rootBytesInitial, 1);
+      _writeVarint(rootRaw, 1);
     }
-
-    // lengths
     for (final id in writtenIds) {
-      _writeVarint(rootBytesInitial, tiles[id]!.length);
+      _writeVarint(rootRaw, tileLoc[id]!.length);
     }
-
-    // offsets (offset+1 form to avoid zero special-case)
     int currentOffset = 0;
     for (final id in writtenIds) {
-      _writeVarint(rootBytesInitial, currentOffset + 1);
-      currentOffset += tiles[id]!.length;
+      _writeVarint(rootRaw, currentOffset + 1);
+      currentOffset += tileLoc[id]!.length;
     }
 
     bool useLeaf = false;
-    List<int> rootBytes = rootBytesInitial;
-    List<int> leafBytes = const <int>[]; // empty unless fallback
+    List<int> rootBytes = rootRaw;
+    List<int> leafBytes = const <int>[];
 
-    final prospectiveRootLen = rootBytes.length;
-    if (headerLength + prospectiveRootLen > headerAndRootMaxLength) {
-      // Fallback: single leaf directory containing all tile entries.
+    // Internal gzip compression for root
+    final gzip = GZipCodec();
+    rootBytes = gzip.encode(rootBytes);
+
+    if (headerLength + rootBytes.length > headerAndRootMaxLength) {
       useLeaf = true;
 
-      // Build leaf directory with all tile entries (same encoding as rootBytesInitial tile-only form)
-      final leaf = <int>[];
-      _writeVarint(leaf, n); // number of entries
-      int lastId2 = 0;
-      for (final id in writtenIds) {
-        final delta = id - lastId2;
-        lastId2 = id;
-        _writeVarint(leaf, delta);
+      // Segment leaf into chunks (e.g., 4096 entries per leaf)
+      const maxLeafEntries = 4096;
+      final leaves = <List<int>>[];
+      int start = 0;
+      while (start < n) {
+        final end = math.min(start + maxLeafEntries, n);
+        final ids = writtenIds.sublist(start, end);
+        final raw = <int>[];
+        _writeVarint(raw, ids.length);
+        int last = 0;
+        for (final id in ids) {
+          final d = id - last;
+          last = id;
+          _writeVarint(raw, d);
+        }
+        for (var i = 0; i < ids.length; i++) {
+          _writeVarint(raw, 1);
+        }
+        for (final id in ids) {
+          _writeVarint(raw, tileLoc[id]!.length);
+        }
+        int off = 0;
+        for (final id in ids) {
+          _writeVarint(raw, off + 1);
+          off += tileLoc[id]!.length;
+        }
+        leaves.add(gzip.encode(raw));
+        start = end;
       }
-      // runs = 1
-      for (var i = 0; i < n; i++) {
-        _writeVarint(leaf, 1);
-      }
-      // lengths
-      for (final id in writtenIds) {
-        _writeVarint(leaf, tiles[id]!.length);
-      }
-      // tile offsets
-      int offset2 = 0;
-      for (final id in writtenIds) {
-        _writeVarint(leaf, offset2 + 1);
-        offset2 += tiles[id]!.length;
-      }
-      leafBytes = leaf;
 
-      // Build compact root with single leaf entry.
-      rootBytes = <int>[];
-      _writeVarint(rootBytes, 1); // one entry
-      // delta for first tileId
-      _writeVarint(rootBytes, writtenIds.first);
-      // runs: single runLength=0 (leaf pointer)
-      _writeVarint(rootBytes, 0);
-      // length: leaf directory length
-      _writeVarint(rootBytes, leafBytes.length);
-      // offset: leaf directory offset +1 (0+1)
-      _writeVarint(rootBytes, 1);
+      // Build compact root with N leaf entries
+      final rootComp = <int>[];
+      _writeVarint(rootComp, leaves.length);
+      int firstId = writtenIds.first;
+      for (int i = 0; i < leaves.length; i++) {
+        // Set a representative tileId delta: for first leaf use firstId, nächste Leaves verwenden deren ersten ID
+        final leafFirstId = writtenIds[i * maxLeafEntries];
+        final delta = i == 0 ? leafFirstId : (leafFirstId - writtenIds[(i - 1) * maxLeafEntries]);
+        _writeVarint(rootComp, delta);
+      }
+      for (int i = 0; i < leaves.length; i++) {
+        _writeVarint(rootComp, 0); // runLength=0 -> leaf pointer
+      }
+      for (final lb in leaves) {
+        _writeVarint(rootComp, lb.length);
+      }
+      // Offsets within leaf section, concatenated
+      int leafOff = 0;
+      for (final lb in leaves) {
+        _writeVarint(rootComp, leafOff + 1);
+        leafOff += lb.length;
+      }
+      rootBytes = gzip.encode(rootComp);
 
       if (headerLength + rootBytes.length > headerAndRootMaxLength) {
-        throw CorruptArchiveException('Fallback root (len=${rootBytes.length}) still exceeds 16KB limit');
+        throw CorruptArchiveException('Compressed root still exceeds 16KB limit');
       }
+
+      // We'll write leaves after metadata as a concatenated blob
+      leafBytes = leaves.expand((e) => e).toList();
     }
 
     final rootDirectoryOffset = headerLength; // 127 bytes
@@ -215,28 +256,25 @@ Future<ExtractResult> _extractSubset(
     // Metadata JSON
     final metadata = metadataOverride ?? <String, dynamic>{};
     final metadataJson = json.encode(metadata);
-    final metadataBytes = utf8.encode(metadataJson);
+    final metadataBytes = gzip.encode(utf8.encode(metadataJson));
 
     final metadataOffset = rootDirectoryOffset + rootDirectoryLength;
     final metadataLength = metadataBytes.length;
 
-    // Leaf directories (if used)
-    final leafDirectoriesOffset = useLeaf ? metadataOffset + metadataLength : 0;
+    final leafDirectoriesOffset = useLeaf ? (metadataOffset + metadataLength) : 0;
     final leafDirectoriesLength = useLeaf ? leafBytes.length : 0;
 
-    final tileDataOffset = useLeaf
-        ? leafDirectoriesOffset + leafDirectoriesLength
-        : metadataOffset + metadataLength;
+    final int tileDataOffset = useLeaf
+        ? (leafDirectoriesOffset + leafDirectoriesLength)
+        : (metadataOffset + metadataLength);
     final tileDataLength = totalTileBytes;
 
     // Build header
     final headerBytes = Uint8List(headerLength);
     final header = ByteData.view(headerBytes.buffer);
-
-    // Magic 'PMTiles' + version 3
     final magic = utf8.encode('PMTiles');
     headerBytes.setRange(0, magic.length, magic);
-    header.setUint8(0x07, 3); // version
+    header.setUint8(0x07, 3);
 
     void setUint64(int offset, int value) {
       header.setUint32(offset, value & 0xffffffff, Endian.little);
@@ -252,18 +290,16 @@ Future<ExtractResult> _extractSubset(
     setUint64(0x38, tileDataOffset);
     setUint64(0x40, tileDataLength);
 
-    // Counts (simplified)
-    setUint64(0x48, n); // numberOfAddressedTiles
-    setUint64(0x50, useLeaf ? (n) : n); // numberOfTileEntries (leaf entries only if leaf used)
-    setUint64(0x58, n); // numberOfTileContents
+    setUint64(0x48, n);
+    setUint64(0x50, n);
+    setUint64(0x58, n);
 
-    // Flags & enums
-    header.setUint8(0x60, 1); // clustered
-    header.setUint8(0x61, 1); // internalCompression = none
+    // clustered & internalCompression=gzip
+    header.setUint8(0x60, 1);
+    header.setUint8(0x61, 2); // gzip
     header.setUint8(0x62, source.tileCompression.index);
     header.setUint8(0x63, source.tileType.index);
 
-    // Copy zooms & bounds
     header.setUint8(0x64, outMinZoom);
     header.setUint8(0x65, outMaxZoom);
 
@@ -279,11 +315,10 @@ Future<ExtractResult> _extractSubset(
 
     final centerLat = (minLat + maxLat) / 2.0;
     final centerLon = (minLon + maxLon) / 2.0;
-    final centerZoom = outMinZoom; // simple heuristic
+    final centerZoom = outMinZoom;
     header.setUint8(0x76, centerZoom);
     writeLatLng(0x77, centerLat, centerLon);
 
-    // Write out file
     final file = File(destinationPath);
     final sink = file.openWrite();
     try {
@@ -293,13 +328,22 @@ Future<ExtractResult> _extractSubset(
       if (useLeaf) {
         sink.add(leafBytes);
       }
-      for (final id in writtenIds) {
-        sink.add(tiles[id]!);
+      final raf = await tempFile.open();
+      try {
+        for (final id in writtenIds) {
+          final loc = tileLoc[id]!;
+          await raf.setPosition(loc.offset);
+          final bytes = await raf.read(loc.length);
+          sink.add(bytes);
+        }
+      } finally {
+        await raf.close();
       }
       await sink.flush();
     } finally {
       await sink.close();
     }
+    try { await tempFile.delete(); } catch (_) {}
 
     return ExtractResult(
       requestedTiles: tileIds.length,

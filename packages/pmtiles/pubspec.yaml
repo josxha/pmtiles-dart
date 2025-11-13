@@ -29,6 +29,9 @@ dependencies:
   # For decoding compressed data
   archive: ^3.4.10
 
+  # For content hashing (deduplication)
+  crypto: ^3.0.3
+
 dev_dependencies:
   lints: ^3.0.0
   test: ^1.25.2
