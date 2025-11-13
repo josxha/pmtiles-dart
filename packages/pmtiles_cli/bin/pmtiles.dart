@@ -139,7 +139,7 @@ class ExtractCommand extends Command {
   }
 
   @override
-  String get invocation => 'pmtiles extract [--metadata <file.json>] [--bbox W,S,E,N] [--minzoom Z] [--maxzoom Z] <source> <dest> [<tileId>...]';
+  String get invocation => 'pmtiles extract [--metadata <file.json>] [--bbox W,S,E,N] [--minzoom Z] [--maxzoom Z] <source> <dest>';
 
   @override
   void run() async {
