@@ -124,11 +124,46 @@ class TileCommand extends Command {
   }
 }
 
+class ExtractCommand extends Command {
+  @override
+  final name = 'extract';
+  @override
+  final description = 'Extract a subset of tiles into a new archive';
+
+  ExtractCommand() {
+    argParser.addOption('metadata', help: 'Path to JSON metadata override');
+  }
+
+  @override
+  String get invocation => 'pmtiles extract [--metadata <file.json>] <source> <dest> <tileId>...';
+
+  @override
+  void run() async {
+    if (argResults!.rest.length < 3) {
+      throw UsageException('Need <source> <dest> and at least one <tileId>', usage);
+    }
+    final source = argResults!.rest[0];
+    final dest = argResults!.rest[1];
+    final ids = argResults!.rest.sublist(2).map(int.parse).toList();
+
+    Map<String, dynamic>? metadata;
+    final metadataPath = argResults!['metadata'] as String?;
+    if (metadataPath != null) {
+      final content = await File(metadataPath).readAsString();
+      metadata = json.decode(content) as Map<String, dynamic>;
+    }
+
+    final result = await extractSubset(source, dest, ids, metadataOverride: metadata);
+    stderr.writeln('Wrote ${result.writtenTiles} tiles (requested ${result.requestedTiles}, missing ${result.skippedMissingTiles}) to $dest');
+  }
+}
+
 main(List<String> args) async {
   CommandRunner('pmtiles', 'A pmtiles command line tool (written in dart).')
     ..addCommand(ShowCommand())
     ..addCommand(TileCommand())
     ..addCommand(ZxyCommand())
+    ..addCommand(ExtractCommand())
     ..run(args).catchError((error) {
       if (error is! UsageException) throw error;
       print(error);

@@ -10,6 +10,7 @@ export 'src/header.dart';
 export 'src/tile.dart';
 export 'src/types.dart';
 export 'src/zxy.dart';
+export 'src/writer.dart';
 
 @visibleForTesting
 export 'src/io.dart';

@@ -1,3 +1,7 @@
+## 1.4.0 (unreleased)
+
+ - Experimental subset extraction API `extractSubset` and CLI command `pmtiles extract`.
+
 ## 1.3.0
 
  - Added support for dart2js builds

@@ -70,6 +70,35 @@ Future<int> main() async {
 
 ```
 
+## Subset Extraction (Experimental)
+
+A minimal writer is included to build a new PMTiles archive containing a subset of tiles from an existing source archive.
+
+```dart
+final result = await extractSubset(
+  '/path/to/source.pmtiles',
+  '/path/to/dest.pmtiles',
+  [ZXY(4,3,2).toTileId(), ZXY(4,3,3).toTileId()],
+  metadataOverride: {'name': 'subset demo'},
+);
+print(result); // ExtractResult(...)
+```
+
+Limitations:
+* Only clustered archives written (no leaf directories)
+* internalCompression is always `none`
+* No de-duplication (every requested existing tile becomes a unique entry)
+* Bounds/center copied from source (not recomputed for subset)
+* numberOfAddressedTiles == numberOfTileEntries == numberOfTileContents
+
+CLI usage:
+```bash
+pmtiles extract source.pmtiles subset.pmtiles 12345 23456 34567
+pmtiles extract --metadata meta.json source.pmtiles subset.pmtiles 12345
+```
+
+This is experimental; future versions may add leaf directory generation, recomputed bounds, and tile de-duplication.
+
 ## Support Matrix
 
 Some effort has been made to ensure this library works correctly on
