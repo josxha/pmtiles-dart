@@ -131,20 +131,23 @@ class ExtractCommand extends Command {
   final description = 'Extract a subset of tiles into a new archive';
 
   ExtractCommand() {
-    argParser.addOption('metadata', help: 'Path to JSON metadata override');
+    argParser
+      ..addOption('metadata', help: 'Path to JSON metadata override')
+      ..addOption('bbox', help: 'Bounding box as west,south,east,north')
+      ..addOption('minzoom', help: 'Minimum zoom for bbox mode')
+      ..addOption('maxzoom', help: 'Maximum zoom for bbox mode');
   }
 
   @override
-  String get invocation => 'pmtiles extract [--metadata <file.json>] <source> <dest> <tileId>...';
+  String get invocation => 'pmtiles extract [--metadata <file.json>] [--bbox W,S,E,N --minzoom Z --maxzoom Z] <source> <dest> [<tileId>...]';
 
   @override
   void run() async {
-    if (argResults!.rest.length < 3) {
-      throw UsageException('Need <source> <dest> and at least one <tileId>', usage);
+    if (argResults!.rest.length < 2) {
+      throw UsageException('Need <source> <dest> and either <tileId>... or --bbox with --minzoom/--maxzoom', usage);
     }
     final source = argResults!.rest[0];
     final dest = argResults!.rest[1];
-    final ids = argResults!.rest.sublist(2).map(int.parse).toList();
 
     Map<String, dynamic>? metadata;
     final metadataPath = argResults!['metadata'] as String?;
@@ -153,6 +156,46 @@ class ExtractCommand extends Command {
       metadata = json.decode(content) as Map<String, dynamic>;
     }
 
+    final bboxStr = argResults!['bbox'] as String?;
+    final minZoomStr = argResults!['minzoom'] as String?;
+    final maxZoomStr = argResults!['maxzoom'] as String?;
+
+    if (bboxStr != null || minZoomStr != null || maxZoomStr != null) {
+      // bbox mode requires all three
+      if (bboxStr == null || minZoomStr == null || maxZoomStr == null) {
+        throw UsageException('When using --bbox you must also pass --minzoom and --maxzoom', usage);
+      }
+      final parts = bboxStr.split(',');
+      if (parts.length != 4) {
+        throw UsageException('Invalid --bbox format, expected west,south,east,north', usage);
+      }
+      final west = double.parse(parts[0]);
+      final south = double.parse(parts[1]);
+      final east = double.parse(parts[2]);
+      final north = double.parse(parts[3]);
+      final minZ = int.parse(minZoomStr);
+      final maxZ = int.parse(maxZoomStr);
+
+      final result = await extractSubsetByBounds(
+        source,
+        dest,
+        west: west,
+        south: south,
+        east: east,
+        north: north,
+        minZoom: minZ,
+        maxZoom: maxZ,
+        metadataOverride: metadata,
+      );
+      stderr.writeln('Wrote ${result.writtenTiles} tiles (requested ${result.requestedTiles}, missing ${result.skippedMissingTiles}) to $dest');
+      return;
+    }
+
+    // tileId list mode
+    if (argResults!.rest.length < 3) {
+      throw UsageException('Provide at least one <tileId> when not using --bbox', usage);
+    }
+    final ids = argResults!.rest.sublist(2).map(int.parse).toList();
     final result = await extractSubset(source, dest, ids, metadataOverride: metadata);
     stderr.writeln('Wrote ${result.writtenTiles} tiles (requested ${result.requestedTiles}, missing ${result.skippedMissingTiles}) to $dest');
   }

@@ -32,7 +32,7 @@ void main() {
     }
 
     // Cleanup
-    await File(dest).delete();
+    // await File(dest).delete();
   });
 
   test('extract subset multiple tiles', () async {
