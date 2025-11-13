@@ -25,6 +25,14 @@ class _Bounds {
   const _Bounds(this.west, this.south, this.east, this.north);
 }
 
+class _RunEntry {
+  final int tileId;
+  final int run;
+  final int length;
+  final int offset;
+  const _RunEntry(this.tileId, this.run, this.length, this.offset);
+}
+
 /// Result / statistics of a subset extraction.
 class ExtractResult {
   final int requestedTiles;
@@ -150,6 +158,54 @@ Future<ExtractResult> _extractSubset(
       acc += contentIndex[h]!.length;
     }
 
+    // Build run-length entries by coalescing adjacent tileIds with identical content
+    final runEntries = <_RunEntry>[];
+    int? curStart;
+    int? curPrev;
+    String? curHash;
+    int? curLen;
+    int? curOff;
+    int curRun = 0;
+    void flushRun() {
+      if (curStart != null) {
+        runEntries.add(_RunEntry(curStart!, curRun, curLen!, curOff!));
+      }
+      curStart = null;
+      curPrev = null;
+      curHash = null;
+      curLen = null;
+      curOff = null;
+      curRun = 0;
+    }
+    for (final id in writtenIds) {
+      final h = idHash[id]!;
+      final off = contentFinalOffset[h]!;
+      final len = contentIndex[h]!.length;
+      if (curStart == null) {
+        curStart = id;
+        curPrev = id;
+        curHash = h;
+        curLen = len;
+        curOff = off;
+        curRun = 1;
+        continue;
+      }
+      if (id == curPrev! + 1 && h == curHash && len == curLen && off == curOff) {
+        curPrev = id;
+        curRun++;
+      } else {
+        flushRun();
+        curStart = id;
+        curPrev = id;
+        curHash = h;
+        curLen = len;
+        curOff = off;
+        curRun = 1;
+      }
+    }
+    flushRun();
+    final entryCount = runEntries.length;
+
     // Compute header-derived stats from selected tiles
     int outMinZoom = 1 << 30;
     int outMaxZoom = -1;
@@ -226,44 +282,86 @@ Future<ExtractResult> _extractSubset(
       _writeVarint(rootRaw, off + 1);
     }
 
+    // Build root directory candidates
+    List<int> buildRootBytesFromIds() {
+      final raw = <int>[];
+      _writeVarint(raw, n);
+      int lastId = 0;
+      for (final id in writtenIds) {
+        final delta = id - lastId;
+        lastId = id;
+        _writeVarint(raw, delta);
+      }
+      for (var i = 0; i < n; i++) {
+        _writeVarint(raw, 1);
+      }
+      for (final id in writtenIds) {
+        final h = idHash[id]!;
+        _writeVarint(raw, contentIndex[h]!.length);
+      }
+      for (final id in writtenIds) {
+        final h = idHash[id]!;
+        final off = contentFinalOffset[h]!;
+        _writeVarint(raw, off + 1);
+      }
+      return raw;
+    }
+
+    List<int> buildRootBytesFromRuns(List<_RunEntry> runs) {
+      final raw = <int>[];
+      _writeVarint(raw, runs.length);
+      int lastId = 0;
+      for (final e in runs) {
+        final delta = e.tileId - lastId;
+        lastId = e.tileId;
+        _writeVarint(raw, delta);
+      }
+      for (final e in runs) { _writeVarint(raw, e.run); }
+      for (final e in runs) { _writeVarint(raw, e.length); }
+      for (final e in runs) { _writeVarint(raw, e.offset + 1); }
+      return raw;
+    }
+
+    // Internal gzip compression with higher level
+    final gzip = GZipCodec(level: 9);
+
+    // Try root-only with all ids
+    List<int> rootBytes = gzip.encode(buildRootBytesFromIds());
+    bool usedRunsInRoot = false;
+
+    // If too big, try root-only with run-length coalesced entries
+    if (headerLength + rootBytes.length > headerAndRootMaxLength) {
+      final rootBytesRun = gzip.encode(buildRootBytesFromRuns(runEntries));
+      if (headerLength + rootBytesRun.length <= headerAndRootMaxLength) {
+        rootBytes = rootBytesRun;
+        usedRunsInRoot = true;
+      }
+    }
+
     bool useLeaf = false;
-    List<int> rootBytes = rootRaw;
     List<int> leafBytes = const <int>[];
 
-    // Internal gzip compression for root
-    final gzip = GZipCodec();
-    rootBytes = gzip.encode(rootBytes);
-
+    // If still too big, fallback to leaves built from runs (more compact)
     if (headerLength + rootBytes.length > headerAndRootMaxLength) {
       useLeaf = true;
-
       // Segment leaf into chunks (e.g., 4096 entries per leaf)
       const maxLeafEntries = 4096;
       final leaves = <List<int>>[];
       int start = 0;
-      while (start < n) {
-        final end = math.min(start + maxLeafEntries, n);
-        final ids = writtenIds.sublist(start, end);
+      while (start < entryCount) {
+        final end = math.min(start + maxLeafEntries, entryCount);
+        final part = runEntries.sublist(start, end);
         final raw = <int>[];
-        _writeVarint(raw, ids.length);
+        _writeVarint(raw, part.length);
         int last = 0;
-        for (final id in ids) {
-          final d = id - last;
-          last = id;
+        for (final e in part) {
+          final d = e.tileId - last;
+          last = e.tileId;
           _writeVarint(raw, d);
         }
-        for (var i = 0; i < ids.length; i++) {
-          _writeVarint(raw, 1);
-        }
-        for (final id in ids) {
-          final h = idHash[id]!;
-          _writeVarint(raw, contentIndex[h]!.length);
-        }
-        for (final id in ids) {
-          final h = idHash[id]!;
-          final off = contentFinalOffset[h]!;
-          _writeVarint(raw, off + 1);
-        }
+        for (final e in part) { _writeVarint(raw, e.run); }
+        for (final e in part) { _writeVarint(raw, e.length); }
+        for (final e in part) { _writeVarint(raw, e.offset + 1); }
         leaves.add(gzip.encode(raw));
         start = end;
       }
@@ -271,32 +369,20 @@ Future<ExtractResult> _extractSubset(
       // Build compact root with N leaf entries
       final rootComp = <int>[];
       _writeVarint(rootComp, leaves.length);
-      int firstId = writtenIds.first;
       for (int i = 0; i < leaves.length; i++) {
-        // Set a representative tileId delta: for first leaf use firstId, nächste Leaves verwenden deren ersten ID
-        final leafFirstId = writtenIds[i * maxLeafEntries];
-        final delta = i == 0 ? leafFirstId : (leafFirstId - writtenIds[(i - 1) * maxLeafEntries]);
+        final leafFirstId = runEntries[i * maxLeafEntries].tileId;
+        final delta = i == 0 ? leafFirstId : (leafFirstId - runEntries[(i - 1) * maxLeafEntries].tileId);
         _writeVarint(rootComp, delta);
       }
-      for (int i = 0; i < leaves.length; i++) {
-        _writeVarint(rootComp, 0); // runLength=0 -> leaf pointer
-      }
-      for (final lb in leaves) {
-        _writeVarint(rootComp, lb.length);
-      }
-      // Offsets within leaf section, concatenated
+      for (int i = 0; i < leaves.length; i++) { _writeVarint(rootComp, 0); }
+      for (final lb in leaves) { _writeVarint(rootComp, lb.length); }
       int leafOff = 0;
-      for (final lb in leaves) {
-        _writeVarint(rootComp, leafOff + 1);
-        leafOff += lb.length;
-      }
+      for (final lb in leaves) { _writeVarint(rootComp, leafOff + 1); leafOff += lb.length; }
       rootBytes = gzip.encode(rootComp);
 
       if (headerLength + rootBytes.length > headerAndRootMaxLength) {
         throw CorruptArchiveException('Compressed root still exceeds 16KB limit');
       }
-
-      // We'll write leaves after metadata as a concatenated blob
       leafBytes = leaves.expand((e) => e).toList();
     }
 
@@ -348,7 +434,7 @@ Future<ExtractResult> _extractSubset(
     setUint64(0x40, tileDataLength);
 
     setUint64(0x48, n);
-    setUint64(0x50, n);
+    setUint64(0x50, useLeaf ? entryCount : (usedRunsInRoot ? entryCount : n));
     setUint64(0x58, uniqueCount);
 
     // clustered & internalCompression=gzip

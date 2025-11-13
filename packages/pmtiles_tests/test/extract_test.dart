@@ -71,6 +71,62 @@ void main() {
           // Root compressed and leaf directories present for full copy (likely)
           expect(subset.header.rootDirectoryLength, lessThan(16384));
           expect(subset.header.numberOfTileContents, lessThanOrEqualTo(subset.header.numberOfTileEntries));
+
+          // Fetch a few tiles derived from header bbox at minZoom and verify bytes are readable
+          final ids = <int>[];
+          final z = subset.header.minZoom;
+          // Helper conversions
+          int lonToX(double lon, int z) {
+            final n = 1 << z;
+            return (((lon + 180.0) / 360.0) * n).floor().clamp(0, n - 1);
+          }
+          int latToY(double lat, int z) {
+            final n = 1 << z;
+            final latRad = lat * math.pi / 180.0;
+            final y = (1 - math.log(math.tan(latRad) + 1 / math.cos(latRad)) / math.pi) / 2 * n;
+            return y.floor().clamp(0, n - 1);
+          }
+          final west = subset.header.minPosition.longitude;
+          final south = subset.header.minPosition.latitude;
+          final east = subset.header.maxPosition.longitude;
+          final north = subset.header.maxPosition.latitude;
+          final xStart = lonToX(west, z);
+          final xEnd = lonToX(east, z);
+          final yStart = latToY(north, z);
+          final yEnd = latToY(south, z);
+          for (int x = math.min(xStart, xEnd); x <= math.max(xStart, xEnd); x++) {
+            for (int y = math.min(yStart, yEnd); y <= math.max(yStart, yEnd); y++) {
+              ids.add(ZXY(z, x, y).toTileId());
+              if (ids.length >= 8) break;
+            }
+            if (ids.length >= 8) break;
+          }
+          expect(ids, isNotEmpty, reason: 'should have at least one candidate tile id');
+
+          // Single fetch
+          final ok = <int>[];
+          for (final id in ids) {
+            try {
+              final t = await subset.tile(id);
+              final bytes = t.compressedBytes();
+              if (bytes.isNotEmpty) ok.add(id);
+            } catch (_) {
+              // ignore missing/empty, try next
+            }
+            if (ok.length >= 3) break;
+          }
+          expect(ok, isNotEmpty, reason: 'should be able to read at least one real tile payload');
+
+          // Batch fetch via tiles([...]) stream
+          final wanted = ok.take(3).toList();
+          final got = <int, List<int>>{};
+          await for (final t in subset.tiles(wanted)) {
+            got[t.id] = t.compressedBytes();
+          }
+          expect(got.keys.toSet(), equals(wanted.toSet()));
+          for (final id in wanted) {
+            expect(got[id]!, isNotEmpty, reason: 'batch tile $id should have non-empty payload');
+          }
         } finally {
           await subset.close();
         }
