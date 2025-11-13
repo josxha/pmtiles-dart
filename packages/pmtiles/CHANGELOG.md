@@ -1,6 +1,7 @@
 ## 1.4.0 (unreleased)
 
- - Experimental subset extraction API `extractSubset` and CLI command `pmtiles extract`.
+ - Experimental subset extraction API `extractSubsetByBounds` (tileId list mode removed; defaults use source bounds/zooms).
+ - Experimental CLI command `pmtiles extract`.
 
 ## 1.3.0
 

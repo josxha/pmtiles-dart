@@ -72,32 +72,43 @@ Future<int> main() async {
 
 ## Subset Extraction (Experimental)
 
-A minimal writer is included to build a new PMTiles archive containing a subset of tiles from an existing source archive.
+A minimal writer builds a new PMTiles archive containing tiles selected by an (optional) bounding box and zoom range. If no parameters are provided, the full source range (bounds + zooms) is used.
 
 ```dart
-final result = await extractSubset(
-  '/path/to/source.pmtiles',
-  '/path/to/dest.pmtiles',
-  [ZXY(4,3,2).toTileId(), ZXY(4,3,3).toTileId()],
-  metadataOverride: {'name': 'subset demo'},
-);
-print(result); // ExtractResult(...)
+void example() async {
+  // Extract full archive (may fail if root >16KB with current limitations)
+  await extractSubsetByBounds('source.pmtiles', 'full_copy.pmtiles');
+
+  // Extract by bounding box and zoom range
+  await extractSubsetByBounds(
+    'source.pmtiles',
+    'subset.pmtiles',
+    west: -10,
+    south: 35,
+    east: 30,
+    north: 60,
+    minZoom: 2,
+    maxZoom: 3,
+  );
+}
 ```
 
 Limitations:
 * Only clustered archives written (no leaf directories)
 * internalCompression is always `none`
-* No de-duplication (every requested existing tile becomes a unique entry)
-* Bounds/center copied from source (not recomputed for subset)
+* No de-duplication (each tile becomes its own entry)
+* Bounds, zooms, center recomputed from subset; if none provided defaults come from source header
 * numberOfAddressedTiles == numberOfTileEntries == numberOfTileContents
+* Full-archive extraction can exceed the 16KB header+root limit and throw an exception
 
 CLI usage:
 ```bash
-pmtiles extract source.pmtiles subset.pmtiles 12345 23456 34567
-pmtiles extract --metadata meta.json source.pmtiles subset.pmtiles 12345
-```
+# Full archive copy (within writer limits)
+pmtiles extract source.pmtiles copy.pmtiles
 
-This is experimental; future versions may add leaf directory generation, recomputed bounds, and tile de-duplication.
+# BBox + zoom constrained
+pmtiles extract --bbox -10,35,30,60 --minzoom 2 --maxzoom 3 source.pmtiles subset.pmtiles
+```
 
 ## Support Matrix
 

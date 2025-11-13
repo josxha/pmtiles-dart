@@ -56,7 +56,7 @@ void _writeVarint(List<int> out, int value) {
 ///  * Metadata can be overridden, otherwise '{}'.
 ///
 /// Throws [ArgumentError] for invalid input or [CorruptArchiveException] if header+root exceed 16KB.
-Future<ExtractResult> extractSubset(
+Future<ExtractResult> _extractSubset(
   String sourceArchivePath,
   String destinationPath,
   List<int> tileIds, {
@@ -129,41 +129,88 @@ Future<ExtractResult> extractSubset(
     }
 
     // Build root directory buffer mirroring Directory.from expectations.
-    final rootBytes = <int>[];
+    final rootBytesInitial = <int>[];
 
     // Number of entries
-    _writeVarint(rootBytes, n);
+    _writeVarint(rootBytesInitial, n);
 
     int lastId = 0;
     for (final id in writtenIds) {
       final delta = id - lastId;
       lastId = id;
-      _writeVarint(rootBytes, delta);
+      _writeVarint(rootBytesInitial, delta);
     }
 
     // runLength = 1 each
     for (var i = 0; i < n; i++) {
-      _writeVarint(rootBytes, 1);
+      _writeVarint(rootBytesInitial, 1);
     }
 
     // lengths
     for (final id in writtenIds) {
-      _writeVarint(rootBytes, tiles[id]!.length);
+      _writeVarint(rootBytesInitial, tiles[id]!.length);
     }
 
     // offsets (offset+1 form to avoid zero special-case)
     int currentOffset = 0;
     for (final id in writtenIds) {
-      _writeVarint(rootBytes, currentOffset + 1);
+      _writeVarint(rootBytesInitial, currentOffset + 1);
       currentOffset += tiles[id]!.length;
+    }
+
+    bool useLeaf = false;
+    List<int> rootBytes = rootBytesInitial;
+    List<int> leafBytes = const <int>[]; // empty unless fallback
+
+    final prospectiveRootLen = rootBytes.length;
+    if (headerLength + prospectiveRootLen > headerAndRootMaxLength) {
+      // Fallback: single leaf directory containing all tile entries.
+      useLeaf = true;
+
+      // Build leaf directory with all tile entries (same encoding as rootBytesInitial tile-only form)
+      final leaf = <int>[];
+      _writeVarint(leaf, n); // number of entries
+      int lastId2 = 0;
+      for (final id in writtenIds) {
+        final delta = id - lastId2;
+        lastId2 = id;
+        _writeVarint(leaf, delta);
+      }
+      // runs = 1
+      for (var i = 0; i < n; i++) {
+        _writeVarint(leaf, 1);
+      }
+      // lengths
+      for (final id in writtenIds) {
+        _writeVarint(leaf, tiles[id]!.length);
+      }
+      // tile offsets
+      int offset2 = 0;
+      for (final id in writtenIds) {
+        _writeVarint(leaf, offset2 + 1);
+        offset2 += tiles[id]!.length;
+      }
+      leafBytes = leaf;
+
+      // Build compact root with single leaf entry.
+      rootBytes = <int>[];
+      _writeVarint(rootBytes, 1); // one entry
+      // delta for first tileId
+      _writeVarint(rootBytes, writtenIds.first);
+      // runs: single runLength=0 (leaf pointer)
+      _writeVarint(rootBytes, 0);
+      // length: leaf directory length
+      _writeVarint(rootBytes, leafBytes.length);
+      // offset: leaf directory offset +1 (0+1)
+      _writeVarint(rootBytes, 1);
+
+      if (headerLength + rootBytes.length > headerAndRootMaxLength) {
+        throw CorruptArchiveException('Fallback root (len=${rootBytes.length}) still exceeds 16KB limit');
+      }
     }
 
     final rootDirectoryOffset = headerLength; // 127 bytes
     final rootDirectoryLength = rootBytes.length;
-
-    if (rootDirectoryOffset + rootDirectoryLength > headerAndRootMaxLength) {
-      throw CorruptArchiveException('Root directory (len=$rootDirectoryLength) together with header exceeds 16KB limit');
-    }
 
     // Metadata JSON
     final metadata = metadataOverride ?? <String, dynamic>{};
@@ -173,11 +220,13 @@ Future<ExtractResult> extractSubset(
     final metadataOffset = rootDirectoryOffset + rootDirectoryLength;
     final metadataLength = metadataBytes.length;
 
-    // No leaf directories
-    const leafDirectoriesOffset = 0;
-    const leafDirectoriesLength = 0;
+    // Leaf directories (if used)
+    final leafDirectoriesOffset = useLeaf ? metadataOffset + metadataLength : 0;
+    final leafDirectoriesLength = useLeaf ? leafBytes.length : 0;
 
-    final tileDataOffset = metadataOffset + metadataLength;
+    final tileDataOffset = useLeaf
+        ? leafDirectoriesOffset + leafDirectoriesLength
+        : metadataOffset + metadataLength;
     final tileDataLength = totalTileBytes;
 
     // Build header
@@ -205,7 +254,7 @@ Future<ExtractResult> extractSubset(
 
     // Counts (simplified)
     setUint64(0x48, n); // numberOfAddressedTiles
-    setUint64(0x50, n); // numberOfTileEntries
+    setUint64(0x50, useLeaf ? (n) : n); // numberOfTileEntries (leaf entries only if leaf used)
     setUint64(0x58, n); // numberOfTileContents
 
     // Flags & enums
@@ -241,6 +290,9 @@ Future<ExtractResult> extractSubset(
       sink.add(headerBytes);
       sink.add(rootBytes);
       sink.add(metadataBytes);
+      if (useLeaf) {
+        sink.add(leafBytes);
+      }
       for (final id in writtenIds) {
         sink.add(tiles[id]!);
       }
@@ -264,78 +316,92 @@ Future<ExtractResult> extractSubset(
 Future<ExtractResult> extractSubsetByBounds(
   String sourceArchivePath,
   String destinationPath, {
-  required double west,
-  required double south,
-  required double east,
-  required double north,
-  required int minZoom,
-  required int maxZoom,
+  double? west,
+  double? south,
+  double? east,
+  double? north,
+  int? minZoom,
+  int? maxZoom,
   Map<String, dynamic>? metadataOverride,
 }) async {
-  if (minZoom < 0 || maxZoom < minZoom || maxZoom > ZXY.maxAllowedZoom) {
-    throw ArgumentError('Invalid zoom range: minZoom=$minZoom maxZoom=$maxZoom');
-  }
-  // Normalize bbox; allow antimeridian by splitting later if west>east
-  if (south > north) {
-    throw ArgumentError('south must be <= north');
-  }
-
-  // Clamp latitude to Web Mercator limits
-  const maxLat = 85.05112877980659;
-  south = south.clamp(-maxLat, maxLat);
-  north = north.clamp(-maxLat, maxLat);
-
-  // Helper conversions
-  double _lonToX(double lon, int z) {
-    final n = 1 << z;
-    final x = ((lon + 180.0) / 360.0) * n;
-    return x;
-  }
-
-  double _latToY(double lat, int z) {
-    final n = 1 << z;
-    final latRad = lat * math.pi / 180.0;
-    final y = (1 - math.log(math.tan(latRad) + 1 / math.cos(latRad)) / math.pi) / 2 * n;
-    return y;
-  }
-
-  final tileIds = <int>{};
-  for (int z = minZoom; z <= maxZoom; z++) {
-    final n = 1 << z;
-
-    // Compute ranges. y grows southward; north has smaller y than south.
-    int yMin = _latToY(north, z).floor();
-    int yMax = _latToY(south, z).floor();
-    yMin = yMin.clamp(0, n - 1);
-    yMax = yMax.clamp(0, n - 1);
-    if (yMax < yMin) {
-      final t = yMin;
-      yMin = yMax;
-      yMax = t;
+  // Open source to derive defaults when params are null
+  final src = await PmTilesArchive.from(sourceArchivePath);
+  try {
+    final effMinZoom = (minZoom ?? src.minZoom).clamp(0, ZXY.maxAllowedZoom);
+    final effMaxZoom = (maxZoom ?? src.maxZoom).clamp(0, ZXY.maxAllowedZoom);
+    if (effMaxZoom < effMinZoom) {
+      throw ArgumentError('Invalid zoom range: minZoom=$effMinZoom maxZoom=$effMaxZoom');
     }
 
-    // X can wrap the antimeridian; split if needed
-    int westX = _lonToX(west, z).floor();
-    int eastX = _lonToX(east, z).floor();
-    westX = westX.clamp(0, n - 1);
-    eastX = eastX.clamp(0, n - 1);
+    // Fill bbox from source header if not provided
+    double effWest = west ?? src.minPosition.longitude;
+    double effSouth = south ?? src.minPosition.latitude;
+    double effEast = east ?? src.maxPosition.longitude;
+    double effNorth = north ?? src.maxPosition.latitude;
 
-    List<(int,int)> xRanges;
-    if (west <= east) {
-      xRanges = [(westX, eastX)];
-    } else {
-      // bbox crosses 180 meridian
-      xRanges = [(0, eastX), (westX, n - 1)];
+    if (effSouth > effNorth) {
+      throw ArgumentError('south must be <= north');
     }
 
-    for (final (xStart, xEnd) in xRanges) {
-      for (int x = xStart; x <= xEnd; x++) {
-        for (int y = yMin; y <= yMax; y++) {
-          tileIds.add(ZXY(z, x, y).toTileId());
+    // Clamp latitude to Web Mercator limits
+    const maxLat = 85.05112877980659;
+    effSouth = effSouth.clamp(-maxLat, maxLat);
+    effNorth = effNorth.clamp(-maxLat, maxLat);
+
+    // Helper conversions
+    double _lonToX(double lon, int z) {
+      final n = 1 << z;
+      final x = ((lon + 180.0) / 360.0) * n;
+      return x;
+    }
+
+    double _latToY(double lat, int z) {
+      final n = 1 << z;
+      final latRad = lat * math.pi / 180.0;
+      final y = (1 - math.log(math.tan(latRad) + 1 / math.cos(latRad)) / math.pi) / 2 * n;
+      return y;
+    }
+
+    final tileIds = <int>{};
+    for (int z = effMinZoom; z <= effMaxZoom; z++) {
+      final n = 1 << z;
+
+      // Compute ranges. y grows southward; north has smaller y than south.
+      int yMin = _latToY(effNorth, z).floor();
+      int yMax = _latToY(effSouth, z).floor();
+      yMin = yMin.clamp(0, n - 1);
+      yMax = yMax.clamp(0, n - 1);
+      if (yMax < yMin) {
+        final t = yMin;
+        yMin = yMax;
+        yMax = t;
+      }
+
+      // X can wrap the antimeridian; split if needed
+      int westX = _lonToX(effWest, z).floor();
+      int eastX = _lonToX(effEast, z).floor();
+      westX = westX.clamp(0, n - 1);
+      eastX = eastX.clamp(0, n - 1);
+
+      List<(int,int)> xRanges;
+      if (effWest <= effEast) {
+        xRanges = [(westX, eastX)];
+      } else {
+        // bbox crosses 180 meridian
+        xRanges = [(0, eastX), (westX, n - 1)];
+      }
+
+      for (final (xStart, xEnd) in xRanges) {
+        for (int x = xStart; x <= xEnd; x++) {
+          for (int y = yMin; y <= yMax; y++) {
+            tileIds.add(ZXY(z, x, y).toTileId());
+          }
         }
       }
     }
-  }
 
-  return extractSubset(sourceArchivePath, destinationPath, tileIds.toList(), metadataOverride: metadataOverride);
+    return _extractSubset(sourceArchivePath, destinationPath, tileIds.toList(), metadataOverride: metadataOverride);
+  } finally {
+    await src.close();
+  }
 }
