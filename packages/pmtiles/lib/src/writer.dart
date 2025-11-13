@@ -30,17 +30,19 @@ class ExtractResult {
   final int requestedTiles;
   final int writtenTiles;
   final int skippedMissingTiles;
+  final int skippedEmptyTiles;
   final int bytesTileData;
 
   ExtractResult({
     required this.requestedTiles,
     required this.writtenTiles,
     required this.skippedMissingTiles,
+    required this.skippedEmptyTiles,
     required this.bytesTileData,
   });
 
   @override
-  String toString() => 'ExtractResult(requested=$requestedTiles, written=$writtenTiles, missing=$skippedMissingTiles, tileBytes=$bytesTileData)';
+  String toString() => 'ExtractResult(requested=$requestedTiles, written=$writtenTiles, missing=$skippedMissingTiles, empty=$skippedEmptyTiles, tileBytes=$bytesTileData)';
 }
 
 // Simple varint (LEB128 style) writer matching protobuf CodedBufferReader expectations.
@@ -97,10 +99,16 @@ Future<ExtractResult> _extractSubset(
     final idHash = <int, String>{}; // tileId -> hash
     int tempOffset = 0;
     int missing = 0;
+    int skippedEmpty = 0;
     // Use batching stream API for efficient reads
     await for (final t in source.tiles(uniqueIds)) {
       try {
         final bytes = t.compressedBytes();
+        if (bytes.isEmpty) {
+          // Skip empty tiles entirely (don't index them)
+          skippedEmpty++;
+          continue;
+        }
         // Deduplicate by SHA-256 of compressed bytes
         final hash = crypto.sha256.convert(bytes).toString();
         final existing = contentIndex[hash];
@@ -392,6 +400,7 @@ Future<ExtractResult> _extractSubset(
       requestedTiles: tileIds.length,
       writtenTiles: n,
       skippedMissingTiles: missing,
+      skippedEmptyTiles: skippedEmpty,
       bytesTileData: totalTileBytes,
     );
   } finally {

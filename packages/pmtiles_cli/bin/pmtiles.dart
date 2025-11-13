@@ -189,13 +189,13 @@ class ExtractCommand extends Command {
         maxZoom: maxZ,
         metadataOverride: metadata,
       );
-      stderr.writeln('Wrote ${result.writtenTiles} tiles (requested ${result.requestedTiles}, missing ${result.skippedMissingTiles}) to $dest');
+      stderr.writeln('Wrote ${result.writtenTiles} tiles (requested ${result.requestedTiles}, missing ${result.skippedMissingTiles}, empty ${result.skippedEmptyTiles}) to $dest');
       return;
     }
 
     // Default: derive bbox+zoom from source (full archive extraction)
     final result = await extractSubsetByBounds(source, dest);
-    stderr.writeln('Wrote ${result.writtenTiles} tiles to $dest (full archive)');
+    stderr.writeln('Wrote ${result.writtenTiles} tiles to $dest (full archive; missing ${result.skippedMissingTiles}, empty ${result.skippedEmptyTiles})');
   }
 }
 
