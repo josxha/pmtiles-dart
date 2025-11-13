@@ -303,9 +303,16 @@ Future<ExtractResult> _extractSubset(
     final rootDirectoryOffset = headerLength; // 127 bytes
     final rootDirectoryLength = rootBytes.length;
 
-    // Metadata JSON
-    final metadata = metadataOverride ?? <String, dynamic>{};
-    final metadataJson = json.encode(metadata);
+    // Metadata JSON: copy from source, merge overrides if provided
+    Map<String, dynamic> baseMetadata = {};
+    final srcMeta = await source.metadata;
+    if (srcMeta is Map<String, dynamic>) {
+      baseMetadata = Map<String, dynamic>.from(srcMeta);
+    }
+    final effectiveMetadata = metadataOverride == null
+        ? baseMetadata
+        : {...baseMetadata, ...metadataOverride};
+    final metadataJson = json.encode(effectiveMetadata);
     final metadataBytes = gzip.encode(utf8.encode(metadataJson));
 
     final metadataOffset = rootDirectoryOffset + rootDirectoryLength;

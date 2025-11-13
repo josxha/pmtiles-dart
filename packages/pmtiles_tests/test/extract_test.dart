@@ -112,5 +112,56 @@ void main() {
       await File(dest).delete();
     });
   });
-}
 
+  group('metadata copy and overrides', () {
+    test('copies metadata from source by default', () async {
+      final source = 'samples/countries.pmtiles';
+      final dest = 'samples/_extract_meta_copy.pmtiles';
+      addTearDown(() async {
+        final f = File(dest);
+        if (await f.exists()) {
+          await f.delete();
+        }
+      });
+
+      final src = await PmTilesArchive.from(source);
+      final srcMeta = await src.metadata;
+      await src.close();
+
+      final result = await extractSubsetByBounds(source, dest);
+      expect(result.writtenTiles, greaterThan(0));
+
+      final subset = await PmTilesArchive.from(dest);
+      try {
+        final dstMeta = await subset.metadata;
+        expect(dstMeta, isA<Map<String, dynamic>>());
+        expect(dstMeta, equals(srcMeta));
+      } finally {
+        await subset.close();
+      }
+    });
+
+    test('merges metadata overrides over source metadata', () async {
+      final source = 'samples/countries.pmtiles';
+      final dest = 'samples/_extract_meta_override.pmtiles';
+      addTearDown(() async {
+        final f = File(dest);
+        if (await f.exists()) {
+          await f.delete();
+        }
+      });
+
+      final override = {'test_key': 'test_value'};
+      final result = await extractSubsetByBounds(source, dest, metadataOverride: override);
+      expect(result.writtenTiles, greaterThan(0));
+
+      final subset = await PmTilesArchive.from(dest);
+      try {
+        final dstMeta = await subset.metadata as Map<String, dynamic>;
+        expect(dstMeta['test_key'], equals('test_value'));
+      } finally {
+        await subset.close();
+      }
+    });
+  });
+}
