@@ -17,6 +17,14 @@ class _Loc {
   const _Loc(this.offset, this.length);
 }
 
+class _Bounds {
+  final double west;
+  final double south;
+  final double east;
+  final double north;
+  const _Bounds(this.west, this.south, this.east, this.north);
+}
+
 /// Result / statistics of a subset extraction.
 class ExtractResult {
   final int requestedTiles;
@@ -69,6 +77,7 @@ Future<ExtractResult> _extractSubset(
   String destinationPath,
   List<int> tileIds, {
   Map<String, dynamic>? metadataOverride,
+  _Bounds? boundsOverride,
 }) async {
   if (tileIds.isEmpty) {
     throw ArgumentError('tileIds must not be empty');
@@ -168,6 +177,22 @@ Future<ExtractResult> _extractSubset(
       maxLon = math.max(maxLon, east);
       minLat = math.min(minLat, south);
       maxLat = math.max(maxLat, north);
+    }
+
+    // If a bbox was provided, prefer it for header bounds/center when it doesn't cross the antimeridian
+    double headerMinLon = minLon;
+    double headerMaxLon = maxLon;
+    double headerMinLat = minLat;
+    double headerMaxLat = maxLat;
+    if (boundsOverride != null) {
+      final b = boundsOverride;
+      // only override if west <= east (no antimeridian crossing)
+      if (b.west <= b.east) {
+        headerMinLon = b.west;
+        headerMaxLon = b.east;
+        headerMinLat = b.south;
+        headerMaxLat = b.north;
+      }
     }
 
     // Build root directory buffer mirroring Directory.from expectations.
@@ -327,11 +352,11 @@ Future<ExtractResult> _extractSubset(
       header.setInt32(offset + 4, latitude, Endian.little);
     }
 
-    writeLatLng(0x66, minLat, minLon);
-    writeLatLng(0x6E, maxLat, maxLon);
+    writeLatLng(0x66, headerMinLat, headerMinLon);
+    writeLatLng(0x6E, headerMaxLat, headerMaxLon);
 
-    final centerLat = (minLat + maxLat) / 2.0;
-    final centerLon = (minLon + maxLon) / 2.0;
+    final centerLat = ((headerMinLat + headerMaxLat) / 2.0);
+    final centerLon = ((headerMinLon + headerMaxLon) / 2.0);
     final centerZoom = outMinZoom;
     header.setUint8(0x76, centerZoom);
     writeLatLng(0x77, centerLat, centerLon);
@@ -462,7 +487,14 @@ Future<ExtractResult> extractSubsetByBounds(
       }
     }
 
-    return _extractSubset(sourceArchivePath, destinationPath, tileIds.toList(), metadataOverride: metadataOverride);
+    final bounds = _Bounds(effWest, effSouth, effEast, effNorth);
+    return _extractSubset(
+      sourceArchivePath,
+      destinationPath,
+      tileIds.toList(),
+      metadataOverride: metadataOverride,
+      boundsOverride: bounds,
+    );
   } finally {
     await src.close();
   }
