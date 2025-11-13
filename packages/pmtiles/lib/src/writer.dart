@@ -83,7 +83,9 @@ Future<ExtractResult> _extractSubset(
     final tempFile = File(tempPath);
     final tempSink = tempFile.openWrite();
     final tileLoc = <int, _Loc>{};
-    final contentIndex = <String, _Loc>{}; // hash -> location
+    final contentIndex = <String, _Loc>{}; // hash -> location in temp
+    final uniqueOrder = <String>[]; // hash order of first occurrence
+    final idHash = <int, String>{}; // tileId -> hash
     int tempOffset = 0;
     int missing = 0;
     // Use batching stream API for efficient reads
@@ -95,12 +97,15 @@ Future<ExtractResult> _extractSubset(
         final existing = contentIndex[hash];
         if (existing != null) {
           tileLoc[t.id] = existing;
+          idHash[t.id] = hash;
           continue;
         }
         tempSink.add(bytes);
         final loc = _Loc(tempOffset, bytes.length);
         tileLoc[t.id] = loc;
         contentIndex[hash] = loc;
+        uniqueOrder.add(hash);
+        idHash[t.id] = hash;
         tempOffset += bytes.length;
       } on TileNotFoundException {
         missing++;
@@ -118,6 +123,15 @@ Future<ExtractResult> _extractSubset(
     final totalTileBytes = tempOffset;
     final writtenIds = tileLoc.keys.toList()..sort();
     final n = writtenIds.length;
+    final uniqueCount = uniqueOrder.length;
+
+    // Build mapping from content hash to final offset in output tile data
+    final contentFinalOffset = <String, int>{};
+    int acc = 0;
+    for (final h in uniqueOrder) {
+      contentFinalOffset[h] = acc;
+      acc += contentIndex[h]!.length;
+    }
 
     // Compute header-derived stats from selected tiles
     int outMinZoom = 1 << 30;
@@ -169,12 +183,14 @@ Future<ExtractResult> _extractSubset(
       _writeVarint(rootRaw, 1);
     }
     for (final id in writtenIds) {
-      _writeVarint(rootRaw, tileLoc[id]!.length);
+      final h = idHash[id]!;
+      _writeVarint(rootRaw, contentIndex[h]!.length);
     }
     int currentOffset = 0;
     for (final id in writtenIds) {
-      _writeVarint(rootRaw, currentOffset + 1);
-      currentOffset += tileLoc[id]!.length;
+      final h = idHash[id]!;
+      final off = contentFinalOffset[h]!;
+      _writeVarint(rootRaw, off + 1);
     }
 
     bool useLeaf = false;
@@ -207,12 +223,13 @@ Future<ExtractResult> _extractSubset(
           _writeVarint(raw, 1);
         }
         for (final id in ids) {
-          _writeVarint(raw, tileLoc[id]!.length);
+          final h = idHash[id]!;
+          _writeVarint(raw, contentIndex[h]!.length);
         }
-        int off = 0;
         for (final id in ids) {
+          final h = idHash[id]!;
+          final off = contentFinalOffset[h]!;
           _writeVarint(raw, off + 1);
-          off += tileLoc[id]!.length;
         }
         leaves.add(gzip.encode(raw));
         start = end;
@@ -267,7 +284,7 @@ Future<ExtractResult> _extractSubset(
     final int tileDataOffset = useLeaf
         ? (leafDirectoriesOffset + leafDirectoriesLength)
         : (metadataOffset + metadataLength);
-    final tileDataLength = totalTileBytes;
+    final tileDataLength = acc;
 
     // Build header
     final headerBytes = Uint8List(headerLength);
@@ -292,7 +309,7 @@ Future<ExtractResult> _extractSubset(
 
     setUint64(0x48, n);
     setUint64(0x50, n);
-    setUint64(0x58, n);
+    setUint64(0x58, uniqueCount);
 
     // clustered & internalCompression=gzip
     header.setUint8(0x60, 1);
@@ -330,8 +347,9 @@ Future<ExtractResult> _extractSubset(
       }
       final raf = await tempFile.open();
       try {
-        for (final id in writtenIds) {
-          final loc = tileLoc[id]!;
+        // Write unique contents only, in order
+        for (final h in uniqueOrder) {
+          final loc = contentIndex[h]!;
           await raf.setPosition(loc.offset);
           final bytes = await raf.read(loc.length);
           sink.add(bytes);
