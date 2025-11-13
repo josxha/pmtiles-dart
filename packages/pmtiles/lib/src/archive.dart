@@ -360,6 +360,28 @@ class PmTilesArchive {
     return _f.close();
   }
 
+  /// Enumeriert alle adressierten Tile-IDs (expandiert Run-Length; traversiert Leafs).
+  Future<List<int>> addressedTileIds() async {
+    final ids = <int>[];
+    for (final e in root.entries) {
+      if (e.isLeaf) {
+        final leafDir = await _leaf(e.offset, e.length);
+        for (final le in leafDir.entries) {
+          if (le.isLeaf) continue; // Keine verschachtelten Leafs erwartet
+          for (int tid = le.tileId; tid < le.tileId + le.runLength; tid++) {
+            ids.add(tid);
+          }
+        }
+      } else {
+        for (int tid = e.tileId; tid < e.tileId + e.runLength; tid++) {
+          ids.add(tid);
+        }
+      }
+    }
+    ids.sort();
+    return ids;
+  }
+
   /// The version of the PMTiles spec this archive uses.
   int get version => header.version;
 

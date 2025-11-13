@@ -220,4 +220,59 @@ void main() {
       }
     });
   });
+
+  group('full archive integrity', () {
+    test('all addressed tiles can be enumerated and fetched', () async {
+      final source = 'samples/countries.pmtiles';
+      final dest = 'samples/_extract_full_integrity.pmtiles';
+
+      final result = await extractSubsetByBounds(source, dest);
+      expect(result.writtenTiles, greaterThan(0));
+
+      final subset = await PmTilesArchive.from(dest);
+      try {
+        final ids = await subset.addressedTileIds();
+        expect(ids.length, equals(subset.header.numberOfAddressedTiles));
+        expect(ids, isNotEmpty);
+        for (int i = 1; i < ids.length; i++) {
+          expect(ids[i] > ids[i - 1], isTrue, reason: 'IDs must be strictly increasing');
+        }
+
+        // Zufällige Stichprobe: 20 eindeutige IDs mit festem Seed
+        final rand = math.Random(42);
+        final sampleSet = <int>{};
+        while (sampleSet.length < math.min(20, ids.length)) {
+          sampleSet.add(ids[rand.nextInt(ids.length)]);
+        }
+        final sample = sampleSet.toList();
+
+        final fetchedRandom = <int, List<int>>{};
+        await for (final t in subset.tiles(sample)) {
+          try {
+            final b = t.compressedBytes();
+            if (b.isNotEmpty) fetchedRandom[t.id] = b;
+          } catch (_) {}
+        }
+        expect(fetchedRandom.keys.toSet(), equals(sampleSet), reason: 'All random sampled tiles should be fetched');
+
+        // Deterministische erste 50 IDs Batch
+        final sample50 = ids.take(50).toList();
+        final fetched = <int, List<int>>{};
+        await for (final t in subset.tiles(sample50)) {
+          try {
+            final b = t.compressedBytes();
+            if (b.isNotEmpty) fetched[t.id] = b;
+          } catch (_) {}
+        }
+        expect(fetched.keys.length, greaterThan(0));
+        expect(fetched.keys.toSet(), equals(sample50.toSet()));
+
+        expect(subset.header.numberOfTileContents, lessThanOrEqualTo(subset.header.numberOfAddressedTiles));
+        expect(subset.header.numberOfTileEntries, lessThanOrEqualTo(subset.header.numberOfAddressedTiles));
+      } finally {
+        await subset.close();
+      }
+      await File(dest).delete();
+    });
+  });
 }
